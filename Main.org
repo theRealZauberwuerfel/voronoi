@@ -1,0 +1,148 @@
+- TODO make it dynamic
+- TODO write a GUI with Glade around it
+
+* 
+  #+AUTHOR: Some people from [[https://rosettacode.org][Rosettacode]] and \textsc{Rubik}
+  #+CATEGORY: graphics
+  #+DATE: \today
+  #+TITLE: Voronoi Diagrams in Haskell
+  #+SUBTITLE: Static bitmap generating with ~Repa~
+
+  \textit{Abstract.} This presents a program for generating random Voronoi diagrams in Haskell as bitmaps.
+  The code base is taken from Rosettacode, but didn't compile. GHC and Emacs had several things to
+  complain about, so I fixed it. I also want to make the user interaction more dynamic, which means you
+  can specify the parameters for e.g. number of points, resolution and output file name at start.
+
+  #+LATEX: \hskip6pt
+
+  You are strongly advised to use the following options for compilation with GHC:
+
+  #+NAME: compile-code
+  #+BEGIN_SRC sh :export no :tangle no
+    ghc --make -O2 -fllvm -fforce-recomp -threaded Main.hs -o main
+  #+END_SRC
+
+  Notice we use the LLVM backend here. For graphics and numerical stuff
+  it is a great speed up.
+  This goes double for strict evaluation in some fields, so the ~BangPatterns~
+  pragma is needed.
+
+  #+NAME: bang-pragma
+  #+BEGIN_SRC haskell :tangle yes
+    {-# LANGUAGE BangPatterns #-}
+  #+END_SRC
+
+  Imagine we have our program compile-ready, GHC complains about some stuff.
+  It hints us to use ~FlexibleContexts~, so let's try.
+
+  #+NAME: flexible-pragma
+  #+BEGIN_SRC haskell :tangle yes
+    {-# LANGUAGE FlexibleContexts #-}
+  #+END_SRC
+
+  So now we can begin declaring our module and imports.
+
+  #+NAME: module-and-imports
+  #+BEGIN_SRC haskell :tangle yes
+    module Main where
+  
+    import System.Random
+  
+    import Prelude hiding (min, lookup, traverse)
+  
+    import qualified Data.Array.Repa as Repa
+    import           Data.Array.Repa.IO.BMP
+    import           Data.Word
+  #+END_SRC
+
+  Since we deal with RGB pixels, which will be represented as /3-tuples,/
+  it makes sense defining a type alias for it. The ~Word8~ is Haskell's
+  version of an 8-bit integer and this lies in ~Data.Word~:
+
+  #+BEGIN_SRC haskell :tangle yes
+    type RGB = (Word8, Word8, Word8)
+  #+END_SRC
+
+  #+LATEX: % TODO Write polymorphic type alias for ~Repa.Array~.
+
+  Up to here enough of new data types.
+  Let's dive in our main function, not where the magic happens, but ~IO~ side-effects and user interaction:
+
+  #+BEGIN_SRC haskell :tangle yes
+    main :: IO ()
+    main = do
+      let
+        nsites = 30
+        ctable = genColorTable nsites
+      voro <- Repa.computeP 
+            $ colorize ctable (voronoi nsites 2048) :: IO (Repa.Array Repa.U Repa.DIM2 RGB)
+      writeImageToBMP "out.bmp" voro
+  #+END_SRC
+
+  Voronoi diagrams grow into live from a map of points\footnote{Not just 2D, the real cracks play
+  with them in hyperspace.} and using some metric. Here we'll use the normal 2D Euclidian metric.
+  Another example is Manhatten distance, which will make the diagram look slightly different.
+  The function ~sqDistance~ is also inlined, which gives us another speed boost. All
+  parameter fields will evaluate strictly.
+
+  #+BEGIN_SRC haskell :tangle yes
+    sqDistance :: Word32 -> Word32 -> Word32 -> Word32 -> Word32
+    {-# INLINE sqDistance #-}
+    sqDistance !x1 !y1 !x2 !y2 = ((x1-x2)^2) + ((y1-y2)^2)
+  #+END_SRC
+
+  Now comes the rest code, which I can't explain well enough up to now.
+  Random points are generated for the parameters given in ~main~.
+
+  #+BEGIN_SRC haskell :tangle yes
+    centers :: Int -> Int
+            -> Repa.Array Repa.U Repa.DIM2 Word32
+    centers nCenters nCells =
+        Repa.fromListUnboxed (Repa.Z Repa.:. nCenters Repa.:. 2) $ take (2*nCenters) $ randomRs (0, fromIntegral nCells) (mkStdGen 1)
+  
+    applyReduce2 arr f =
+        Repa.traverse arr (\(i  Repa.:. j) -> i) $ \lookup (Repa.Z Repa.:. i) ->
+            f (lookup (Repa.Z Repa.:.i Repa.:.0)) (lookup (Repa.Z Repa.:. i Repa.:. 1))
+  
+    minimize1D array = Repa.foldS f h t
+      where
+        indexed array' = Repa.traverse array' id (\src idx@(Repa.Z Repa.:. i) -> (src idx, (fromIntegral i)))
+        (Repa.Z  Repa.:. n) = Repa.extent array
+        iarr = indexed array
+        h = iarr Repa.! (Repa.Z Repa.:. 0)
+        t = Repa.extract (Repa.Z Repa.:. 1) (Repa.Z Repa.:. (n-1)) iarr
+  
+        f min@(!valMin, !_) x@(!val, !_) | val < valMin = x
+                                         | otherwise = min
+  
+    voronoi :: Int
+            -> Int
+            -> Repa.Array Repa.D Repa.DIM2 Word32
+    voronoi nCenters nCells =
+        let
+          {-# INLINE cellReducer #-}
+          cellReducer = applyReduce2 (centers nCenters nCells)
+          {-# INLINE nearestCenterIndex #-}
+          nearestCenterIndex = snd . (Repa.! Repa.Z) . minimize1D
+        in
+          Repa.fromFunction (Repa.Z Repa.:. nCells Repa.:. nCells :: Repa.DIM2) $ \ (Repa.Z Repa.:. i Repa.:. j) ->
+              nearestCenterIndex $ cellReducer (sqDistance (fromIntegral i) (fromIntegral j))
+  
+    genColorTable :: Int -> Repa.Array Repa.U Repa.DIM1 (Word8, Word8, Word8)
+    genColorTable n = Repa.fromListUnboxed (Repa.Z  Repa.:. n) $ zip3 l1 l2 l3
+        where
+          randomPoints = randomRs (0,255) (mkStdGen 1)
+          (l1, rest1) = splitAt n randomPoints
+          (l2, rest2) = splitAt n rest1
+          l3 = take n rest2
+  
+    colorize :: Repa.Array Repa.U Repa.DIM1 RGB
+             -> Repa.Array Repa.D Repa.DIM2 Word32
+             -> Repa.Array Repa.D Repa.DIM2 RGB
+    colorize ctable = Repa.map $ \x ->
+        ctable Repa.! (Repa.Z Repa.:. fromIntegral x)
+  #+END_SRC
+
+#+LATEX: \newpage
+
+~/projects/voronoi/out.bmp
